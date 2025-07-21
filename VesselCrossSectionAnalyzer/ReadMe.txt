@@ -1,7 +1,4 @@
-http://googleusercontent.com/immersive_entry_chip/0
-
-
-### How to use this code in 3D Slicer:
+### How to use this code in 3D Slicer when used as a standalone module (read toplevel readme for an easier version)
 
 1.  **Save the Code:** Save the content of the immersive block into a file named `VesselCrossSectionAnalyzer.py`.
 2.  **Create Module Folder:** Create a new folder in your Slicer modules directory (e.g., `C:/Users/YourUser/AppData/Roaming/Slicer/Slicer-5.X/ScriptedLoadableModules/VesselCrossSectionAnalyzer` on Windows, or `~/.config/Slicer/Slicer-5.X/ScriptedLoadableModules/VesselCrossSectionAnalyzer` on Linux/macOS). Place `VesselCrossSectionAnalyzer.py` inside this folder.
@@ -57,5 +54,3 @@ http://googleusercontent.com/immersive_entry_chip/0
 * **`VesselCrossSectionAnalyzerTest` (Testing Class):**
     * Provides a simple `setUp` and `runTest` method.
     * `test_VesselCrossSectionAnalyzer1` creates a basic straight midline and a cylindrical model, runs the analysis, and performs basic assertions (e.g., checks if CSV and visualization model exist, and some distance values are as expected for a cylinder). This helps verify the core functionality.
-
-This module should give you a robust starting point for your IVUS catheter image simulation analysis. Let me know if you have any questions or need further modifications!
