@@ -2,6 +2,7 @@ import os
 import unittest
 import vtk, qt, ctk, slicer
 from slicer.ScriptedLoadableModule import *
+import slicer.util
 from slicer.util import VTKObservationMixin
 import numpy as np
 import csv
@@ -11,13 +12,13 @@ import csv
 #
 class VesselCrossSectionAnalyzer(ScriptedLoadableModule):
   """Uses ScriptedLoadableModule base class, available at:
-  [https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py](https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py)
+  [https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py]
   """
 
   def __init__(self, parent):
     ScriptedLoadableModule.__init__(self, parent)
     self.parent.title = "Vessel Cross-Section Analyzer"
-    self.parent.categories = ["Segmentation"]
+    self.parent.categories = ["IVUS Segmentation"]
     self.parent.dependencies = []
     self.parent.contributors = ["Your Name (Your Organization)"] # Replace with your name and organization
     self.parent.helpText = """
@@ -35,7 +36,7 @@ class VesselCrossSectionAnalyzer(ScriptedLoadableModule):
 #
 class VesselCrossSectionAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
   """Uses ScriptedLoadableModuleWidget base class, available at:
-  [https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py](https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py)
+  [https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py]
   """
 
   def __init__(self, parent):
@@ -164,9 +165,9 @@ class VesselCrossSectionAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservat
     self.applyButton.enabled = self.inputMidlineSelector.currentNode() and self.inputModelSelector.currentNode()
 
   def onApplyButton(self):
-    with slicer.util.MessageDialog("Analysis Running", parent=slicer.util.mainWindow()) as msg:
-        msg.setCancelButton(qt.QMessageBox.Cancel)
-        msg.show()
+    with slicer.util.MessageDialog("Analysis Running") as msg: #, parent = slicer.util.mainWindow()
+        #msg.setCancelButton(qt.QMessageBox.Cancel)
+        #msg.show()
 
         slicer.app.processEvents() # Process events to show the dialog
         self.progressBar.setValue(0)
@@ -192,7 +193,7 @@ class VesselCrossSectionAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservat
         finally:
             self.progressBar.setValue(0)
             self.progressBar.hide()
-            msg.close() # Close the dialog
+            # msg.close() # Close the dialog
 
 
 #
@@ -221,8 +222,23 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
     obbTree.SetDataSet(polyData)
     obbTree.BuildLocator()
     return obbTree
+  
+  def cross(self, vectorA, vectorB):
+     '''
+     returns cross product of two inputted vectors
+     '''
+     crossProduct = vtk.vtkVector3d()
+     crossProduct = [vectorA[1]*vectorB[2]-vectorA[2]*vectorB[1], vectorA[0]*vectorB[2]-vectorA[2]*vectorB[0], vectorA[0]*vectorB[1]-vectorA[1]*vectorB[0]]
+     return crossProduct
+  
+  def magn(self, vector):
+     '''
+     returns magnitude of vector
+     '''
+     magnitude = (vector[0]**2 + vector[1]**2 + vector[2]**2)**(1/2)
+     return magnitude
 
-  def getTangentAndPerpendicularBasis(self, curveNode, arcLengthMm, S_axis=(0.0, 0.0, 1.0), R_axis=(1.0, 0.0, 0.0)):
+  def getTangentAndPerpendicularBasis(self, curveNode, arcLengthMm, curveLengthMm, S_axis=(0.0, 0.0, 1.0), R_axis=(1.0, 0.0, 0.0)):
     """
     Calculates the tangent at a given arc length and two orthogonal basis vectors
     (U, V) for the perpendicular plane, with U aligned as much as possible with S_axis.
@@ -234,8 +250,13 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
     """
     point = [0.0, 0.0, 0.0]
     tangent = [0.0, 0.0, 0.0]
-    curveNode.GetPointAtArcLength(arcLengthMm, point)
-    curveNode.GetTangentAtArcLength(arcLengthMm, tangent)
+
+    curveNode.GetMeasurement("curvature mean").SetEnabled(True)
+    positions = slicer.util.arrayFromMarkupsCurvePoints(curveNode, True)
+    stepSize = round(curveLengthMm / len(positions))
+    tangentArray = slicer.util.arrayFromMarkupsCurveData(curveNode, "Tangents", True)
+    tangent = tangentArray[round(arcLengthMm / stepSize)]
+    point = positions[round(arcLengthMm / stepSize)]
 
     # Convert to vtkVector3d for easier operations
     point_vec = vtk.vtkVector3d(point)
@@ -247,32 +268,31 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
 
     # Calculate U_temp = T x S_axis
     U_temp = vtk.vtkVector3d()
-    U_temp.Cross(tangent_vec, S_axis_vec)
-
+    U_temp = self.cross(tangent_vec, S_axis_vec)
+    
     # Check for parallelism (magnitude of cross product near zero)
-    if U_temp.Norm() < 1e-6: # Tangent is parallel to S_axis
+    if self.magn(U_temp) < 1e-6: # Tangent is parallel to S_axis
         # Fallback: cross with R_axis
-        U_temp.Cross(tangent_vec, R_axis_vec)
-        if U_temp.Norm() < 1e-6: # Tangent is also parallel to R_axis (highly unlikely, but for robustness)
+        U_temp = self.cross(tangent_vec, R_axis_vec)
+        if self.magn(U_temp) < 1e-6: # Tangent is also parallel to R_axis (highly unlikely, but for robustness)
             # Pick any perpendicular vector if tangent is collinear with primary axes
             vtk.vtkMath.Perpendiculars(tangent_vec, U_temp, vtk.vtkVector3d()) # U_temp becomes arbitrary perpendicular
     
     U_vector = vtk.vtkVector3d()
-    U_vector.DeepCopy(U_temp)
-    U_vector.Normalize()
+    U_vector = U_temp
 
     # Calculate V_vector = T x U_vector (makes V orthogonal to both T and U)
     V_vector = vtk.vtkVector3d()
-    V_vector.Cross(tangent_vec, U_vector)
-    V_vector.Normalize()
-
+    V_vector = self.cross(tangent_vec, U_vector)
+    #V_vector.Normalize()
+    
     return point_vec, tangent_vec, U_vector, V_vector
 
   def calculateAngleBetweenVectors(self, vec1, vec2):
     """Calculates the angle in degrees between two vtkVector3d objects."""
     dot_product = vec1.Dot(vec2)
-    mag1 = vec1.Norm()
-    mag2 = vec2.Norm()
+    mag1 = self.magn(vec1)
+    mag2 = self.magn(vec2)
     if mag1 == 0 or mag2 == 0:
         return np.nan # Undefined angle if one vector is zero
     
@@ -290,7 +310,7 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
     if not midlineCurveNode or not vesselModelNode:
       raise ValueError("Input midline curve and vessel model are required.")
 
-    slicer.app.set  # Clear any previous messages
+    # slicer.app.set  # Clear any previous messages
     slicer.app.processEvents() # Ensure GUI updates
 
     print(f"Starting analysis for curve '{midlineCurveNode.GetName()}' and model '{vesselModelNode.GetName()}'")
@@ -298,7 +318,7 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
     vesselPolyData = self.getVesselModelPolyData(vesselModelNode)
     obbTree = self.buildOBBTree(vesselPolyData)
 
-    curveLengthMm = midlineCurveNode.GetCurveLength()
+    curveLengthMm = midlineCurveNode.GetCurveLengthWorld()
     if curveLengthMm < stepSizeMm:
       raise ValueError("Curve length is shorter than the step size. Please increase step size or shorten curve.")
 
@@ -329,7 +349,7 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
               slicer.app.processEvents()
 
       try:
-          point, tangent, U_vector, V_vector = self.getTangentAndPerpendicularBasis(midlineCurveNode, arcLengthMm)
+          point, tangent, U_vector, V_vector = self.getTangentAndPerpendicularBasis(midlineCurveNode, arcLengthMm, curveLengthMm)
       except Exception as e:
           print(f"Warning: Could not get tangent/basis at arc length {arcLengthMm:.2f}mm. Skipping this point. Error: {e}")
           continue
@@ -341,26 +361,28 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
         
         # Calculate ray direction in the perpendicular plane
         ray_dir = vtk.vtkVector3d()
-        ray_dir.SetX(U_vector.GetX() * np.cos(angle_rad) + V_vector.GetX() * np.sin(angle_rad))
-        ray_dir.SetY(U_vector.GetY() * np.cos(angle_rad) + V_vector.GetY() * np.sin(angle_rad))
-        ray_dir.SetZ(U_vector.GetZ() * np.cos(angle_rad) + V_vector.GetZ() * np.sin(angle_rad))
-        ray_dir.Normalize()
+        ray_dir.SetX(U_vector[0] * np.cos(angle_rad) + V_vector[0] * np.sin(angle_rad))
+        ray_dir.SetY(U_vector[1] * np.cos(angle_rad) + V_vector[1] * np.sin(angle_rad))
+        ray_dir.SetZ(U_vector[2] * np.cos(angle_rad) + V_vector[2] * np.sin(angle_rad))
+        #ray_dir.Normalize()
 
-        ray_start = [point.GetX(), point.GetY(), point.GetZ()]
+        ray_start = [point[0], point[1], point[2]]
         ray_end = [
-            point.GetX() + ray_dir.GetX() * maxRayLengthMm,
-            point.GetY() + ray_dir.GetY() * maxRayLengthMm,
-            point.GetZ() + ray_dir.GetZ() * maxRayLengthMm
+            point[0] + ray_dir[0] * maxRayLengthMm,
+            point[1] + ray_dir[1] * maxRayLengthMm,
+            point[2] + ray_dir[2] * maxRayLengthMm
         ]
 
-        intersection_point = [0.0, 0.0, 0.0]
-        t = vtk.reference(0.0) # Parametric coordinate of intersection
-        subId = vtk.reference(0)
+        intersection_point = vtk.vtkPoints()
+        #t = vtk.reference(0.0) # Parametric coordinate of intersection
+        #subId = vtk.reference(0)
         cellId = vtk.reference(0)
-        pCoords = [0.0, 0.0, 0.0]
+        #pCoords = [0.0, 0.0, 0.0]
 
         # Perform ray intersection
-        num_intersects = obbTree.IntersectWithLine(ray_start, ray_end, intersection_point, t, subId, cellId)
+        num_intersects = obbTree.IntersectWithLine(ray_start, ray_end, intersection_point, None)
+        
+        print(f"intersectionpoint = {intersection_point}")
 
         distance = float('inf')
         int_x, int_y, int_z = np.nan, np.nan, np.nan
@@ -384,7 +406,7 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
             v2 = vtk.vtkVector3d(p2[0]-p0[0], p2[1]-p0[1], p2[2]-p0[2])
             
             face_normal = vtk.vtkVector3d()
-            face_normal.Cross(v1, v2)
+            face_normal = self.cross(v1, v2)
             face_normal.Normalize()
 
             normal_x, normal_y, normal_z = face_normal.GetX(), face_normal.GetY(), face_normal.GetZ()
@@ -405,12 +427,12 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
             "Tangent_X": tangent.GetX(),
             "Tangent_Y": tangent.GetY(),
             "Tangent_Z": tangent.GetZ(),
-            "U_X": U_vector.GetX(),
-            "U_Y": U_vector.GetY(),
-            "U_Z": U_vector.GetZ(),
-            "V_X": V_vector.GetX(),
-            "V_Y": V_vector.GetY(),
-            "V_Z": V_vector.GetZ(),
+            "U_X": U_vector[0],
+            "U_Y": U_vector[1],
+            "U_Z": U_vector[2],
+            "V_X": V_vector[0],
+            "V_Y": V_vector[1],
+            "V_Z": V_vector[2],
             "RayAngle_Deg": angle_deg,
             "RayDir_X": ray_dir.GetX(),
             "RayDir_Y": ray_dir.GetY(),
@@ -498,8 +520,8 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
     # Define a colormap for standard deviation
     lut = vtk.vtkLookupTable()
     lut.SetNumberOfTableValues(256)
-    lut.SetVectorComponent(0, 0.0, 0.0, 1.0) # Blue for low std dev
-    lut.SetVectorComponent(1, 1.0, 0.0, 0.0) # Red for high std dev
+    lut.SetTableValue(0, 0.0, 0.0, 1.0) # Blue for low std dev
+    lut.SetTableValue(1, 1.0, 0.0, 0.0) # Red for high std dev
     lut.Build()
 
     # Determine min/max std_dev for colormapping
