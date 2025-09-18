@@ -223,22 +223,22 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
     obbTree.BuildLocator()
     return obbTree
   
-  def cross(self, vectorA, vectorB):
+  def cross(self, vectorA, vectorB):   # TAKE OUT FOR NP - us np.cross instead
      '''
      returns cross product of two inputted vectors
      '''
-     crossProduct = vtk.vtkVector3d()
-     crossProduct = [vectorA[1]*vectorB[2]-vectorA[2]*vectorB[1], vectorA[0]*vectorB[2]-vectorA[2]*vectorB[0], vectorA[0]*vectorB[1]-vectorA[1]*vectorB[0]]
+     #crossProduct = vtk.vtkVector3d()
+     crossProduct = vtk.vtkVector3d([vectorA[1]*vectorB[2]-vectorA[2]*vectorB[1], vectorA[0]*vectorB[2]-vectorA[2]*vectorB[0], vectorA[0]*vectorB[1]-vectorA[1]*vectorB[0]])
      return crossProduct
   
-  def magn(self, vector):
+  def magn(self, vector):              # TAKE OUT FOR NP - use np.linalg.norm instead
      '''
      returns magnitude of vector
      '''
      magnitude = (vector[0]**2 + vector[1]**2 + vector[2]**2)**(1/2)
      return magnitude
 
-  def getTangentAndPerpendicularBasis(self, curveNode, arcLengthMm, curveLengthMm, S_axis=(0.0, 0.0, 1.0), R_axis=(1.0, 0.0, 0.0)):
+  def getTangentAndPerpendicularBasis(self, curveNode, arcLengthMm, curveLengthMm, S_axis=np.array((0.0, 0.0, 1.0)), R_axis=np.array((1.0, 0.0, 0.0))):
     """
     Calculates the tangent at a given arc length and two orthogonal basis vectors
     (U, V) for the perpendicular plane, with U aligned as much as possible with S_axis.
@@ -248,45 +248,31 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
     :param R_axis: Right-Left axis vector (default: (1,0,0) for LPS), used for fallback.
     :return: A tuple (point, tangent, U_vector, V_vector).
     """
-    point = [0.0, 0.0, 0.0]
-    tangent = [0.0, 0.0, 0.0]
+    point = np.array([0.0, 0.0, 0.0])
+    tangent = np.array([0.0, 0.0, 0.0])
 
     curveNode.GetMeasurement("curvature mean").SetEnabled(True)
     positions = slicer.util.arrayFromMarkupsCurvePoints(curveNode, True)
     stepSize = round(curveLengthMm / len(positions))
     tangentArray = slicer.util.arrayFromMarkupsCurveData(curveNode, "Tangents", True)
-    tangent = tangentArray[round(arcLengthMm / stepSize)]
     point = positions[round(arcLengthMm / stepSize)]
-
-    # Convert to vtkVector3d for easier operations
-    point_vec = vtk.vtkVector3d(point)
-    tangent_vec = vtk.vtkVector3d(tangent)
-    S_axis_vec = vtk.vtkVector3d(S_axis)
-    R_axis_vec = vtk.vtkVector3d(R_axis)
-
-    tangent_vec.Normalize()
+    tangent = point + tangentArray[round(arcLengthMm / stepSize)]
 
     # Calculate U_temp = T x S_axis
-    U_temp = vtk.vtkVector3d()
-    U_temp = self.cross(tangent_vec, S_axis_vec)
+    U_temp = np.cross(tangent, S_axis)
     
     # Check for parallelism (magnitude of cross product near zero)
-    if self.magn(U_temp) < 1e-6: # Tangent is parallel to S_axis
+    if np.linalg.norm(U_temp) < 1e-6: # Tangent is parallel to S_axis
         # Fallback: cross with R_axis
-        U_temp = self.cross(tangent_vec, R_axis_vec)
-        if self.magn(U_temp) < 1e-6: # Tangent is also parallel to R_axis (highly unlikely, but for robustness)
-            # Pick any perpendicular vector if tangent is collinear with primary axes
-            vtk.vtkMath.Perpendiculars(tangent_vec, U_temp, vtk.vtkVector3d()) # U_temp becomes arbitrary perpendicular
+        U_temp = np.cross(tangent, R_axis)
     
-    U_vector = vtk.vtkVector3d()
-    U_vector = U_temp
+    U_vector = U_temp / np.linalg.norm(U_temp)
 
     # Calculate V_vector = T x U_vector (makes V orthogonal to both T and U)
-    V_vector = vtk.vtkVector3d()
-    V_vector = self.cross(tangent_vec, U_vector)
-    #V_vector.Normalize()
+    V_vector = np.cross(tangent, U_vector)
+    V_vector = V_vector / np.linalg.norm(V_vector)
     
-    return point_vec, tangent_vec, U_vector, V_vector
+    return point, tangent, U_vector, V_vector
 
   def calculateAngleBetweenVectors(self, vec1, vec2):
     """Calculates the angle in degrees between two vtkVector3d objects."""
@@ -317,6 +303,7 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
 
     vesselPolyData = self.getVesselModelPolyData(vesselModelNode)
     obbTree = self.buildOBBTree(vesselPolyData)
+    print(f" tree {obbTree.GetDataSet().GetNumberOfCells()}")
 
     curveLengthMm = midlineCurveNode.GetCurveLengthWorld()
     if curveLengthMm < stepSizeMm:
@@ -365,6 +352,7 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
         ray_dir.SetY(U_vector[1] * np.cos(angle_rad) + V_vector[1] * np.sin(angle_rad))
         ray_dir.SetZ(U_vector[2] * np.cos(angle_rad) + V_vector[2] * np.sin(angle_rad))
         #ray_dir.Normalize()
+      
 
         ray_start = [point[0], point[1], point[2]]
         ray_end = [
@@ -372,17 +360,21 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
             point[1] + ray_dir[1] * maxRayLengthMm,
             point[2] + ray_dir[2] * maxRayLengthMm
         ]
-
+      
         intersection_point = vtk.vtkPoints()
+        intersection_list = vtk.vtkIdList()
         #t = vtk.reference(0.0) # Parametric coordinate of intersection
         #subId = vtk.reference(0)
-        cellId = vtk.reference(0)
+        #cellId = vtk.reference(0)
         #pCoords = [0.0, 0.0, 0.0]
 
         # Perform ray intersection
-        num_intersects = obbTree.IntersectWithLine(ray_start, ray_end, intersection_point, None)
+        num_intersects = obbTree.IntersectWithLine(ray_start, ray_end, intersection_point, intersection_list)
         
-        print(f"intersectionpoint = {intersection_point}")
+        #print(f"ray start {obbTree.InsideOrOutside(ray_start)}")
+        #print(f"ray end {obbTree.InsideOrOutside(ray_end)}")
+        #print(f"point {np.array(intersection_point)}")
+        #print(f"list {np.array(intersection_list)}")
 
         distance = float('inf')
         int_x, int_y, int_z = np.nan, np.nan, np.nan
@@ -390,7 +382,7 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
         angle_ray_normal_deg = np.nan
 
         if num_intersects > 0:
-          # Intersection occurred
+          print(f"Intersection occurred")
           distance = np.linalg.norm(np.array(intersection_point) - np.array(ray_start))
           int_x, int_y, int_z = intersection_point[0], intersection_point[1], intersection_point[2]
           
@@ -421,12 +413,12 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
         all_measurements.append({
             "SampleID": i,
             "ArcLength_mm": arcLengthMm,
-            "Midline_X": point.GetX(),
-            "Midline_Y": point.GetY(),
-            "Midline_Z": point.GetZ(),
-            "Tangent_X": tangent.GetX(),
-            "Tangent_Y": tangent.GetY(),
-            "Tangent_Z": tangent.GetZ(),
+            "Midline_X": point[0],
+            "Midline_Y": point[1],
+            "Midline_Z": point[2],
+            "Tangent_X": tangent[0],
+            "Tangent_Y": tangent[1],
+            "Tangent_Z": tangent[2],
             "U_X": U_vector[0],
             "U_Y": U_vector[1],
             "U_Z": U_vector[2],
@@ -434,9 +426,12 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
             "V_Y": V_vector[1],
             "V_Z": V_vector[2],
             "RayAngle_Deg": angle_deg,
-            "RayDir_X": ray_dir.GetX(),
-            "RayDir_Y": ray_dir.GetY(),
-            "RayDir_Z": ray_dir.GetZ(),
+            "RayDir_X": ray_dir[0],
+            "RayDir_Y": ray_dir[1],
+            "RayDir_Z": ray_dir[2],
+            "RayEnd_X": ray_end[0],
+            "RayEnd_Y": ray_end[1],
+            "RayEnd_Z": ray_end[2],
             "Intersection_X": int_x,
             "Intersection_Y": int_y,
             "Intersection_Z": int_z,
