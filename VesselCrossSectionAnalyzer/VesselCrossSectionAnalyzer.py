@@ -6,6 +6,8 @@ import slicer.util
 from slicer.util import VTKObservationMixin
 import numpy as np
 import csv
+from PIL import Image
+from scipy.ndimage import gaussian_filter
 
 #
 # VesselCrossSectionAnalyzer
@@ -66,7 +68,7 @@ class VesselCrossSectionAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservat
     self.inputMidlineSelector.selectNodeUponCreation = True
     self.inputMidlineSelector.addEnabled = False
     self.inputMidlineSelector.removeEnabled = False
-    self.inputMidlineSelector.noneEnabled = True
+    self.inputMidlineSelector.noneEnabled = False
     self.inputMidlineSelector.showHidden = False
     self.inputMidlineSelector.showChildNodeTypes = False
     self.inputMidlineSelector.setMRMLScene(slicer.mrmlScene)
@@ -79,7 +81,7 @@ class VesselCrossSectionAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservat
     self.inputModelSelector.selectNodeUponCreation = True
     self.inputModelSelector.addEnabled = False
     self.inputModelSelector.removeEnabled = False
-    self.inputModelSelector.noneEnabled = True
+    self.inputModelSelector.noneEnabled = False
     self.inputModelSelector.showHidden = False
     self.inputModelSelector.showChildNodeTypes = False
     self.inputModelSelector.setMRMLScene(slicer.mrmlScene)
@@ -102,7 +104,7 @@ class VesselCrossSectionAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservat
 
     self.rayIncrementDegSpinBox = qt.QDoubleSpinBox()
     self.rayIncrementDegSpinBox.setRange(1.0, 90.0)
-    self.rayIncrementDegSpinBox.setValue(10.0)
+    self.rayIncrementDegSpinBox.setValue(2.0)
     self.rayIncrementDegSpinBox.setDecimals(1)
     self.rayIncrementDegSpinBox.setSuffix(" degrees")
     self.rayIncrementDegSpinBox.setToolTip("Angular increment for rays in the perpendicular plane.")
@@ -130,7 +132,7 @@ class VesselCrossSectionAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservat
     outputOptionsFormLayout.addRow("Output CSV File:", self.outputCsvPathSelector)
 
     self.visualizeCirclesCheckBox = qt.QCheckBox()
-    self.visualizeCirclesCheckBox.setChecked(True)
+    self.visualizeCirclesCheckBox.setChecked(False)
     self.visualizeCirclesCheckBox.setToolTip("Check to visualize cross-sectional circles color-coded by radius variation.")
     outputOptionsFormLayout.addRow("Visualize Circles:", self.visualizeCirclesCheckBox)
 
@@ -202,6 +204,8 @@ class VesselCrossSectionAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservat
 class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
   """This class implements the core logic for the module.
   """
+  # define
+  intersections = np.array([])
 
   def __init__(self):
     ScriptedLoadableModuleLogic.__init__(self)
@@ -223,7 +227,7 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
     obbTree.BuildLocator()
     return obbTree
   
-  def cross(self, vectorA, vectorB):   # TAKE OUT FOR NP - us np.cross instead
+  def cross(self, vectorA, vectorB):   # LEAVE - it does use this for a 3D vector calculation
      '''
      returns cross product of two inputted vectors
      '''
@@ -244,6 +248,7 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
     (U, V) for the perpendicular plane, with U aligned as much as possible with S_axis.
     :param curveNode: vtkMRMLMarkupsCurveNode
     :param arcLengthMm: Arc length in mm along the curve.
+    :param 
     :param S_axis: Superior-Inferior axis vector (default: (0,0,1) for LPS).
     :param R_axis: Right-Left axis vector (default: (1,0,0) for LPS), used for fallback.
     :return: A tuple (point, tangent, U_vector, V_vector).
@@ -300,14 +305,14 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
     slicer.app.processEvents() # Ensure GUI updates
 
     print(f"Starting analysis for curve '{midlineCurveNode.GetName()}' and model '{vesselModelNode.GetName()}'")
-
+    
     vesselPolyData = self.getVesselModelPolyData(vesselModelNode)
+    
     obbTree = self.buildOBBTree(vesselPolyData)
-    print(f" tree {obbTree.GetDataSet().GetNumberOfCells()}")
 
     curveLengthMm = midlineCurveNode.GetCurveLengthWorld()
     if curveLengthMm < stepSizeMm:
-      raise ValueError("Curve length is shorter than the step size. Please increase step size or shorten curve.")
+      raise ValueError("Curve length is shorter than the step size. Please increase curve length or lengthen curve.")
 
     numSteps = int(curveLengthMm / stepSizeMm)
     if numSteps == 0: # Ensure at least one step if curve is very short but longer than 0
@@ -319,6 +324,10 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
 
     currentProgress = 0
     totalSteps = numSteps * (360.0 / rayIncrementDeg) # Rough estimate for progress bar
+    intSteps = int(totalSteps)
+
+    # zeros
+    self.intersections = np.zeros((intSteps, 6))
 
     for i in range(numSteps + 1): # +1 to include the last point even if it's not a full step
       arcLengthMm = i * stepSizeMm
@@ -351,8 +360,6 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
         ray_dir.SetX(U_vector[0] * np.cos(angle_rad) + V_vector[0] * np.sin(angle_rad))
         ray_dir.SetY(U_vector[1] * np.cos(angle_rad) + V_vector[1] * np.sin(angle_rad))
         ray_dir.SetZ(U_vector[2] * np.cos(angle_rad) + V_vector[2] * np.sin(angle_rad))
-        #ray_dir.Normalize()
-      
 
         ray_start = [point[0], point[1], point[2]]
         ray_end = [
@@ -360,21 +367,23 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
             point[1] + ray_dir[1] * maxRayLengthMm,
             point[2] + ray_dir[2] * maxRayLengthMm
         ]
+
+        # start and end are in the right places
+        # currently lists
+        # if i == np.round(numSteps / 2) and angle_deg == 0:
+        #    print(ray_start)
+        #    print(ray_end)
+        #    print(type(ray_end))
       
-        intersection_point = vtk.vtkPoints()
-        intersection_list = vtk.vtkIdList()
-        #t = vtk.reference(0.0) # Parametric coordinate of intersection
-        #subId = vtk.reference(0)
-        #cellId = vtk.reference(0)
-        #pCoords = [0.0, 0.0, 0.0]
+
+        t = vtk.mutable(0.0)
+        pCoords = [0.0, 0.0, 0.0]
+        intersection_point = [0.0, 0.0, 0.0]
+        subID = vtk.mutable(0)
+        cellID =vtk.mutable(0)
 
         # Perform ray intersection
-        num_intersects = obbTree.IntersectWithLine(ray_start, ray_end, intersection_point, intersection_list)
-        
-        #print(f"ray start {obbTree.InsideOrOutside(ray_start)}")
-        #print(f"ray end {obbTree.InsideOrOutside(ray_end)}")
-        #print(f"point {np.array(intersection_point)}")
-        #print(f"list {np.array(intersection_list)}")
+        num_intersects = obbTree.IntersectWithLine(ray_start, ray_end, 0.001, t, intersection_point, pCoords, subID, cellID)
 
         distance = float('inf')
         int_x, int_y, int_z = np.nan, np.nan, np.nan
@@ -382,12 +391,12 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
         angle_ray_normal_deg = np.nan
 
         if num_intersects > 0:
-          print(f"Intersection occurred")
+          #print(f"Intersection occurred")
           distance = np.linalg.norm(np.array(intersection_point) - np.array(ray_start))
           int_x, int_y, int_z = intersection_point[0], intersection_point[1], intersection_point[2]
           
           # Get surface normal at intersection point
-          intersected_cell = vesselPolyData.GetCell(cellId.get())
+          intersected_cell = vesselPolyData.GetCell(cellID.get())
           if intersected_cell and intersected_cell.GetCellType() == vtk.VTK_TRIANGLE: # Ensure it's a triangle
             p0 = vesselPolyData.GetPoint(intersected_cell.GetPointId(0))
             p1 = vesselPolyData.GetPoint(intersected_cell.GetPointId(1))
@@ -462,8 +471,15 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
               "std_dev_radius": np.nan
           }
 
+    # fill with centerpoint and the vessel intersection points
+    cols = ["Midline_X", "Midline_Y", "Midline_Z", "Intersection_X", "Intersection_Y", "Intersection_Z", "Normal_X", "Normal_Y", "Normal_Z"]
+    self.intersections = np.array([[row[col] for col in cols] for row in all_measurements])
+
     # Write to CSV
     self.writeMeasurementsToCsv(outputCsvPath, all_measurements)
+
+    # create images TODO: make this a button
+    image = self.simulateImages(self.intersections)
 
     # Visualize circles
     if visualizeCircles:
@@ -474,6 +490,59 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
         progressBar.setValue(100)
         slicer.app.processEvents()
 
+
+  def simulateImages(self, inputPoints):
+    # desired = np.array([-1.75, -19.91, -347.34])
+    # desired_points_all = np.all(np.abs(inputPoints[:,:3] - desired) <= .5, axis=1)
+    # print(len(inputPoints))
+    count = 0
+    for n in range(0,572): # 0-572
+      try: 
+        singlePoint = inputPoints[n*180:n*180+180, :]
+        centerPoint = singlePoint[1, 0:3]*5
+        rayPoints = singlePoint[0:180, 3:6]*5
+
+        img = np.zeros((200,200))
+        img[:,:] = 0.1
+        midPoint = np.round(len(img)/2).astype(int)
+        alpha = 0
+
+        for i in range(360):
+          distance = 5
+          vector = [distance * np.sin(np.deg2rad(alpha)), distance * np.cos(np.deg2rad(alpha))]
+          vector = np.round(vector).astype(int)
+          img[midPoint - vector[0], midPoint + vector[1]] = 1
+          alpha = alpha + 1
+        alpha = 0
+
+        for i in range(180):
+          edge = rayPoints[i,:]
+          distance = np.sqrt((centerPoint[0]-edge[0])**2 + (centerPoint[1]-edge[1])**2 + (centerPoint[2]-edge[2])**2)
+          vector = [distance * np.sin(np.deg2rad(alpha)), distance * np.cos(np.deg2rad(alpha))]
+          vector = np.round(vector).astype(int)
+          if distance < midPoint:
+            img[midPoint - vector[0], midPoint + vector[1]] = 1
+          for j in range(1,150):
+            for k in np.arange(-3, 3, np.random.uniform(.5, 2)):
+              vector = [(distance + j) * np.sin(np.deg2rad(alpha + k)), (distance + j) * np.cos(np.deg2rad(alpha + k))]
+              vector = np.round(vector).astype(int)
+              if (abs(vector[0]) < 100) & (abs(vector[1]) < 100):
+                img[midPoint - vector[0], midPoint + vector[1]] = .9 * np.exp((-.03 + np.random.uniform(-.007, .007)) * (j-1))
+          alpha = alpha + 2
+
+        img = gaussian_filter(img, sigma=0.5)
+
+        img = (img * 255).astype(np.uint8)
+        image = Image.fromarray(img)
+        image.save(f"C:/Users/hghod/Downloads/Images/points_projection_{n+1}.png")
+        count = count + 1
+      except Exception as e:
+         print(f"error occured with image {n}")
+         continue
+      
+    print(f"{count} images created")
+
+    return image
 
   def writeMeasurementsToCsv(self, outputPath, measurements):
     """
@@ -532,9 +601,13 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
         max_std_dev += 1e-6 # Add a small epsilon
 
     for sample_id, data in crossSectionData.items():
-        point = data["point"]
-        U_vector = data["U_vector"]
-        V_vector = data["V_vector"]
+        point_np = data["point"]
+        point = vtk.vtkVector3d(point_np[0], point_np[1], point_np[2])
+        U_vector_np = data["U_vector"]
+        U_vector = vtk.vtkVector3d(U_vector_np[0], U_vector_np[1], U_vector_np[2])
+        V_vector_np = data["V_vector"]
+        V_vector = vtk.vtkVector3d(V_vector_np[0], V_vector_np[1], V_vector_np[2])
+
         avg_radius = data["avg_radius"]
         std_dev_radius = data["std_dev_radius"]
 
@@ -576,7 +649,7 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
         circleModelNode.SetAndObserveDisplayNodeID(displayNode.GetID())
     
     displayNode.SetScalarVisibility(True)
-    displayNode.SetScalarRangeFlagToAutomatic()
+    #displayNode.SetScalarRangeFlagToAutomatic()
     displayNode.SetActiveScalar("RadiusVariation", vtk.vtkAssignAttribute.POINT_DATA)
     displayNode.SetColorMap(lut)
     displayNode.SetAndObserveColorNodeID(slicer.util.getNode('HotToCold').GetID()) # A good default colormap
