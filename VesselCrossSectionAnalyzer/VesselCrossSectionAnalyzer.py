@@ -8,6 +8,8 @@ import numpy as np
 import csv
 from PIL import Image
 from scipy.ndimage import gaussian_filter
+from datetime import datetime
+
 
 #
 # VesselCrossSectionAnalyzer
@@ -110,19 +112,16 @@ class VesselCrossSectionAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservat
     self.rayIncrementDegSpinBox.setToolTip("Angular increment for rays in the perpendicular plane.")
     samplingParametersFormLayout.addRow("Ray Increment:", self.rayIncrementDegSpinBox)
 
-    self.maxRayLengthMmSpinBox = qt.QDoubleSpinBox()
-    self.maxRayLengthMmSpinBox.setRange(1.0, 1000.0)
-    self.maxRayLengthMmSpinBox.setValue(50.0)
-    self.maxRayLengthMmSpinBox.setDecimals(1)
-    self.maxRayLengthMmSpinBox.setSuffix(" mm")
-    self.maxRayLengthMmSpinBox.setToolTip("Maximum length for rays to search for the vessel boundary. Beyond this, 'infinity' is reported.")
-    samplingParametersFormLayout.addRow("Max Ray Length:", self.maxRayLengthMmSpinBox)
-
     # Output Options
     outputOptionsCollapsibleBtn = ctk.ctkCollapsibleButton()
     outputOptionsCollapsibleBtn.text = "Output Options"
     self.layout.addWidget(outputOptionsCollapsibleBtn)
     outputOptionsFormLayout = qt.QFormLayout(outputOptionsCollapsibleBtn)
+
+    self.outputCsvPathCheckBox = qt.QCheckBox()
+    self.outputCsvPathCheckBox.setChecked(False)
+    self.outputCsvPathCheckBox.setToolTip("Check to export vessel outline data to CSV.")
+    outputOptionsFormLayout.addRow("Output to CSV:", self.outputCsvPathCheckBox)
 
     self.outputCsvPathSelector = ctk.ctkPathLineEdit()
     self.outputCsvPathSelector.filters = ctk.ctkPathLineEdit.Files | ctk.ctkPathLineEdit.Writable
@@ -131,10 +130,35 @@ class VesselCrossSectionAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservat
     self.outputCsvPathSelector.setToolTip("Select the path and filename for the CSV output.")
     outputOptionsFormLayout.addRow("Output CSV File:", self.outputCsvPathSelector)
 
-    self.visualizeCirclesCheckBox = qt.QCheckBox()
-    self.visualizeCirclesCheckBox.setChecked(False)
-    self.visualizeCirclesCheckBox.setToolTip("Check to visualize cross-sectional circles color-coded by radius variation.")
-    outputOptionsFormLayout.addRow("Visualize Circles:", self.visualizeCirclesCheckBox)
+    self.createImagesCheckBox = qt.QCheckBox()
+    self.createImagesCheckBox.setChecked(False)
+    self.createImagesCheckBox.setToolTip("Check to create cross-sectional images of the vessel.")
+    outputOptionsFormLayout.addRow("Create Images:", self.createImagesCheckBox)
+
+    self.numberOfimagesSpinBox = qt.QDoubleSpinBox()
+    self.numberOfimagesSpinBox.setRange(1, 1000)
+    self.numberOfimagesSpinBox.setValue(5)
+    self.numberOfimagesSpinBox.setDecimals(0)
+    self.numberOfimagesSpinBox.setSuffix(" image(s)")
+    self.numberOfimagesSpinBox.setToolTip("Number of images to create along curve.")
+    outputOptionsFormLayout.addRow("Number of Images:", self.numberOfimagesSpinBox)
+
+    self.outputImagePathSelector = ctk.ctkPathLineEdit()
+    self.outputImagePathSelector.filters = ctk.ctkPathLineEdit.Dirs
+    self.outputImagePathSelector.setCurrentPath(os.path.join(os.path.expanduser("~"), "Downloads"))
+    self.outputImagePathSelector.setToolTip("Select the path for image folder output. Images will be in the file format: MMDDYY_HHMM_Image_#")
+    outputOptionsFormLayout.addRow("Output Images Folder:", self.outputImagePathSelector)
+
+    visualizeCirclesOptions = [
+       "Visualize circles at image simulation sites only",
+       "Visualize circles along entire curve",
+       "Do not visualize circles"
+    ]
+    self.visualizeCirclesSelector = qt.QComboBox()
+    self.visualizeCirclesSelector.addItems(visualizeCirclesOptions)
+    self.visualizeCirclesSelector.setCurrentIndex(0)
+    self.visualizeCirclesSelector.setToolTip("Check to visualize cross-sectional circles color-coded by radius variation.")
+    outputOptionsFormLayout.addRow("Visualize Circles:", self.visualizeCirclesSelector)
 
     # Apply Button
     self.applyButton = qt.QPushButton("Apply")
@@ -182,9 +206,12 @@ class VesselCrossSectionAnalyzerWidget(ScriptedLoadableModuleWidget, VTKObservat
                 self.inputModelSelector.currentNode(),
                 self.stepSizeMmSpinBox.value,
                 self.rayIncrementDegSpinBox.value,
-                self.maxRayLengthMmSpinBox.value,
+                self.outputCsvPathCheckBox.isChecked(),
                 self.outputCsvPathSelector.currentPath,
-                self.visualizeCirclesCheckBox.isChecked(),
+                self.visualizeCirclesSelector.currentText,
+                self.createImagesCheckBox.isChecked(),
+                self.numberOfimagesSpinBox.value,
+                self.outputImagePathSelector.currentPath,
                 self.progressBar # Pass progress bar for updates
             )
             slicer.util.delayDisplay("Analysis completed successfully!", 3000)
@@ -242,7 +269,7 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
      magnitude = (vector[0]**2 + vector[1]**2 + vector[2]**2)**(1/2)
      return magnitude
 
-  def getTangentAndPerpendicularBasis(self, curveNode, arcLengthMm, curveLengthMm, S_axis=np.array((0.0, 0.0, 1.0)), R_axis=np.array((1.0, 0.0, 0.0))):
+  def getTangentAndPerpendicularBasis(self, positions, tangentArray, arcLengthMm, curveLengthMm, stepSize, R_axis=np.array((1.0, 0.0, 0.0))):
     """
     Calculates the tangent at a given arc length and two orthogonal basis vectors
     (U, V) for the perpendicular plane, with U aligned as much as possible with S_axis.
@@ -253,30 +280,35 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
     :param R_axis: Right-Left axis vector (default: (1,0,0) for LPS), used for fallback.
     :return: A tuple (point, tangent, U_vector, V_vector).
     """
-    point = np.array([0.0, 0.0, 0.0])
-    tangent = np.array([0.0, 0.0, 0.0])
-
-    curveNode.GetMeasurement("curvature mean").SetEnabled(True)
-    positions = slicer.util.arrayFromMarkupsCurvePoints(curveNode, True)
-    stepSize = round(curveLengthMm / len(positions))
-    tangentArray = slicer.util.arrayFromMarkupsCurveData(curveNode, "Tangents", True)
-    point = positions[round(arcLengthMm / stepSize)]
-    tangent = point + tangentArray[round(arcLengthMm / stepSize)]
+    
+    positionsInterval = (len(positions) / (curveLengthMm / stepSize))
+    point = positions[round(arcLengthMm * positionsInterval)]
+    tangent = point + tangentArray[round(arcLengthMm * positionsInterval)]
 
     # Calculate U_temp = T x S_axis
-    U_temp = np.cross(tangent, S_axis)
+    U_temp = np.cross(tangent, point-tangent)
     
     # Check for parallelism (magnitude of cross product near zero)
     if np.linalg.norm(U_temp) < 1e-6: # Tangent is parallel to S_axis
         # Fallback: cross with R_axis
         U_temp = np.cross(tangent, R_axis)
-    
+
     U_vector = U_temp / np.linalg.norm(U_temp)
 
     # Calculate V_vector = T x U_vector (makes V orthogonal to both T and U)
-    V_vector = np.cross(tangent, U_vector)
+    V_vector = np.cross(tangent-point, U_vector)
     V_vector = V_vector / np.linalg.norm(V_vector)
     
+    # # test printouts 
+    # print(f'tp arcLengthMm {arcLengthMm}')
+    # print(f'tp len positions {len(positions)}')
+    # if arcLengthMm == 5:
+    #   print(f"arcLengthMm: {arcLengthMm}")
+    #   print(f"point: {point}")
+    #   print(f"tangent: {tangent}")
+    #   print(f"U_vector: {U_vector + point}")
+    #   print(f"V_vector: {V_vector + point}")
+
     return point, tangent, U_vector, V_vector
 
   def calculateAngleBetweenVectors(self, vec1, vec2):
@@ -294,7 +326,7 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
     angle_rad = np.arccos(cosine_angle)
     return np.degrees(angle_rad)
 
-  def run(self, midlineCurveNode, vesselModelNode, stepSizeMm, rayIncrementDeg, maxRayLengthMm, outputCsvPath, visualizeCircles, progressBar=None):
+  def run(self, midlineCurveNode, vesselModelNode, stepSizeMm, rayIncrementDeg, outputCsvCheck, outputCsvPath, visualizeCircles, createImages, numberOfImages, outputImgPath, progressBar=None):
     """
     Run the actual algorithm
     """
@@ -305,6 +337,8 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
     slicer.app.processEvents() # Ensure GUI updates
 
     print(f"Starting analysis for curve '{midlineCurveNode.GetName()}' and model '{vesselModelNode.GetName()}'")
+
+    maxRayLengthMm = 50
     
     vesselPolyData = self.getVesselModelPolyData(vesselModelNode)
     
@@ -329,6 +363,13 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
     # zeros
     self.intersections = np.zeros((intSteps, 6))
 
+    # setup for getTangentAndPerpendicularBasis
+    point = np.array([0.0, 0.0, 0.0])
+    tangent = np.array([0.0, 0.0, 0.0])
+    midlineCurveNode.GetMeasurement("curvature mean").SetEnabled(True)
+    positions = slicer.util.arrayFromMarkupsCurvePoints(midlineCurveNode, True)
+    tangentArray = slicer.util.arrayFromMarkupsCurveData(midlineCurveNode, "Tangents", True)
+
     for i in range(numSteps + 1): # +1 to include the last point even if it's not a full step
       arcLengthMm = i * stepSizeMm
       if arcLengthMm > curveLengthMm and i > 0: # Avoid going past the end of the curve for the last point
@@ -345,7 +386,7 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
               slicer.app.processEvents()
 
       try:
-          point, tangent, U_vector, V_vector = self.getTangentAndPerpendicularBasis(midlineCurveNode, arcLengthMm, curveLengthMm)
+          point, tangent, U_vector, V_vector = self.getTangentAndPerpendicularBasis(positions, tangentArray, arcLengthMm, curveLengthMm, stepSizeMm)
       except Exception as e:
           print(f"Warning: Could not get tangent/basis at arc length {arcLengthMm:.2f}mm. Skipping this point. Error: {e}")
           continue
@@ -417,7 +458,6 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
 
           current_section_distances.append(distance)
 
-
         # Store all raw measurements
         all_measurements.append({
             "SampleID": i,
@@ -476,31 +516,40 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
     self.intersections = np.array([[row[col] for col in cols] for row in all_measurements])
 
     # Write to CSV
-    self.writeMeasurementsToCsv(outputCsvPath, all_measurements)
+    if outputCsvCheck:
+        self.writeMeasurementsToCsv(outputCsvPath, all_measurements)
 
-    # create images TODO: make this a button
-    image = self.simulateImages(self.intersections)
+    # Create Images 
+    if createImages:
+        numberOfImages = int(numberOfImages)
+        image = self.simulateImages(self.intersections, rayIncrementDeg, numberOfImages, outputImgPath, midlineCurveNode)
 
     # Visualize circles
-    if visualizeCircles:
-        self.visualizeCrossSectionCircles(cross_section_data)
+    if visualizeCircles == "Visualize circles at image simulation sites only" or "Visualize circles along entire curve":
+        self.visualizeCrossSectionCircles(cross_section_data, visualizeCircles, numberOfImages)
 
+    # todo - make progress bar update correctly when creating images
     print("Analysis complete.")
     if progressBar:
         progressBar.setValue(100)
         slicer.app.processEvents()
 
+    # todo - get average of vessel wall radius and determine avg size cath used for distance
+    #        also can be an input if user knows what size they would use
+    #      - make image and probe diameter based on vessel wall radius
+    #      - change attenuation to rely on MRI data
+    #      - add centerline construction so that it goes through the middle of the vessel, not taking into account the aneurysm
+    #      - add option to create all images
 
-  def simulateImages(self, inputPoints):
-    # desired = np.array([-1.75, -19.91, -347.34])
-    # desired_points_all = np.all(np.abs(inputPoints[:,:3] - desired) <= .5, axis=1)
-    # print(len(inputPoints))
+  def simulateImages(self, inputPoints, rayIncrement, numImages, imgPath, curveName):
     count = 0
-    for n in range(0,572): # 0-572
+    pointsAroundCenter = int(360 / rayIncrement)
+
+    for n in range(0,numImages):
       try: 
-        singlePoint = inputPoints[n*180:n*180+180, :]
+        singlePoint = inputPoints[n*pointsAroundCenter:n*pointsAroundCenter+pointsAroundCenter, :]
         centerPoint = singlePoint[1, 0:3]*5
-        rayPoints = singlePoint[0:180, 3:6]*5
+        rayPoints = singlePoint[0:pointsAroundCenter, 3:6]*5
 
         img = np.zeros((200,200))
         img[:,:] = 0.1
@@ -515,7 +564,7 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
           alpha = alpha + 1
         alpha = 0
 
-        for i in range(180):
+        for i in range(pointsAroundCenter):
           edge = rayPoints[i,:]
           distance = np.sqrt((centerPoint[0]-edge[0])**2 + (centerPoint[1]-edge[1])**2 + (centerPoint[2]-edge[2])**2)
           vector = [distance * np.sin(np.deg2rad(alpha)), distance * np.cos(np.deg2rad(alpha))]
@@ -534,8 +583,13 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
 
         img = (img * 255).astype(np.uint8)
         image = Image.fromarray(img)
-        image.save(f"C:/Users/hghod/Downloads/Images/points_projection_{n+1}.png")
+
+        date = datetime.now().strftime("%m%d%Y_%H%M")
+        if not os.path.exists(f"{imgPath}/{curveName.GetName()}"):
+          os.makedirs(f"{imgPath}/{curveName.GetName()}")
+        image.save(f"{imgPath}/{curveName.GetName()}/{date}_Image_{n+1}.png")
         count = count + 1
+
       except Exception as e:
          print(f"error occured with image {n}")
          continue
@@ -563,15 +617,19 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
       print(f"Error writing CSV file: {e}")
       raise IOError(f"Could not write CSV to {outputPath}: {e}")
 
-  def visualizeCrossSectionCircles(self, crossSectionData):
+  def visualizeCrossSectionCircles(self, crossSectionData, visualizeCircles, numImages):
     """
     Generates and visualizes cross-sectional circles color-coded by radius variation.
+    Number of circles created is dependent on user input.
     """
     print("Generating circle visualization...")
 
     if not crossSectionData:
       print("No cross-section data available for visualization.")
       return
+    
+    if visualizeCircles == "Visualize circles at image simulation sites only":
+       crossSectionData = dict(list(crossSectionData.items())[:int(numImages)])
 
     # Create a single model node for all circles
     circleModelNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", "VesselCrossSectionCircles")
@@ -643,26 +701,25 @@ class VesselCrossSectionAnalyzerLogic(ScriptedLoadableModuleLogic):
     circleModelNode.SetAndObservePolyData(circlePolyData)
 
     # Set display properties
-    displayNode = circleModelNode.GetDisplayNode()
-    if not displayNode:
-        displayNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelDisplayNode")
-        circleModelNode.SetAndObserveDisplayNodeID(displayNode.GetID())
+    # displayNode = circleModelNode.GetDisplayNode()
+    # if not displayNode:
+    #     displayNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelDisplayNode")
+    #     circleModelNode.SetAndObserveDisplayNodeID(displayNode.GetID())
     
-    displayNode.SetScalarVisibility(True)
+    # displayNode.SetScalarVisibility(True)
     #displayNode.SetScalarRangeFlagToAutomatic()
-    displayNode.SetActiveScalar("RadiusVariation", vtk.vtkAssignAttribute.POINT_DATA)
-    displayNode.SetColorMap(lut)
-    displayNode.SetAndObserveColorNodeID(slicer.util.getNode('HotToCold').GetID()) # A good default colormap
-    displayNode.SetSliceDisplayModeToVisibility(slicer.vtkMRMLSliceDisplayNode.Visibility3D)
-    displayNode.SetClippingEnabled(False)
-    displayNode.SetOpacity(0.8)
-    displayNode.SetRepresentation(displayNode.Wireframe) # Wireframe for circles
-    displayNode.SetPointSize(3) # Make points visible if desired
-    displayNode.SetAmbient(0.4)
-    displayNode.SetDiffuse(0.6)
-    displayNode.SetSpecular(0.0)
-    displayNode.SetLighting(True)
-
+    # displayNode.SetActiveScalar("RadiusVariation", vtk.vtkAssignAttribute.POINT_DATA)
+    # displayNode.SetColorMap(lut)
+    # displayNode.SetAndObserveColorNodeID(slicer.util.getNode('HotToCold').GetID()) # A good default colormap
+    # displayNode.SetSliceDisplayModeToVisibility(slicer.vtkMRMLSliceDisplayNode.Visibility3D)
+    # displayNode.SetClippingEnabled(False)
+    # displayNode.SetOpacity(0.8)
+    # displayNode.SetRepresentation(displayNode.Wireframe) # Wireframe for circles
+    # displayNode.SetPointSize(3) # Make points visible if desired
+    # displayNode.SetAmbient(0.4)
+    # displayNode.SetDiffuse(0.6)
+    # displayNode.SetSpecular(0.0)
+    # displayNode.SetLighting(True)
 
     print("Circle visualization created successfully: VesselCrossSectionCircles")
 
